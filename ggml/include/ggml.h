@@ -2949,6 +2949,12 @@ extern "C" {
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data
     GGML_API enum ggml_status  ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads);
 
+    // Per-layer compute timing (GGML_LAYER_TIMING=1). Nodes are attributed to a
+    // layer via their "blk.<il>.<...>" tensor name; everything else lands in a
+    // trailing "other" bucket. Print (and zero) the accumulated buckets.
+    GGML_API void   ggml_layer_timing_print_and_reset(const char * tag);
+    GGML_API double * ggml_layer_timing_table(int * n_buckets);
+
     GGML_API struct ggml_tensor * ggml_graph_get_tensor(struct ggml_cgraph * cgraph, const char * name);
 
     GGML_API void                 ggml_graph_export(const struct ggml_cgraph * cgraph, const char * fname);

@@ -13490,6 +13490,16 @@ void llama_synchronize(struct llama_context * ctx) {
         ctx->n_p_eval += ctx->n_queued_tokens;
     }
 
+    // Per-layer compute timing (GGML_LAYER_TIMING=1). Printed here so that a
+    // long prompt prefill reports incrementally and the numbers survive a
+    // killed run -- llama-cli's own timing block only runs at exit.
+    if (getenv("GGML_LAYER_TIMING") != NULL && ctx->n_queued_tokens > 0) {
+        char tag[64];
+        snprintf(tag, sizeof(tag), "ubatch n=%d%s", ctx->n_queued_tokens,
+                 ctx->n_queued_tokens > 1 ? " (prompt)" : " (gen)");
+        ggml_layer_timing_print_and_reset(tag);
+    }
+
     // get a more accurate load time, upon first eval
     if (ctx->n_queued_tokens > 0 && !ctx->has_evaluated_once) {
         ctx->t_load_us = ggml_time_us() - ctx->t_start_us;

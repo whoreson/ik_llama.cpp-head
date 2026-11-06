@@ -45,6 +45,137 @@
 
 #define IK_PRINT_TIMING 0
 
+// ---------------------------------------------------------------------------
+// Per-layer compute timing (GGML_LAYER_TIMING=1).
+//
+// ik_llama.cpp builds ONE graph for the whole model, so llama.cpp/llama-cli
+// only ever report aggregate prompt-eval and eval times. To see how individual
+// layers behave (in particular the full-attention layers of a hybrid SSM model
+// versus its linear-attention layers) we accumulate the wall time of every
+// node into the bucket of the layer that owns it. Layer ownership comes from
+// the tensor name, which llama.cpp always sets to "blk.<il>.<...>"; nodes that
+// do not carry such a name (the final norm, the output projection) go into a
+// separate bucket.
+//
+// Only thread 0 records, and every node is followed by a ggml_barrier, so the
+// buckets measure layer wall time (all threads), not just thread-0 spin.
+// Printed from ggml_graph_compute() at the end of each graph execution.
+// ---------------------------------------------------------------------------
+double * g_ggml_layer_ms    = NULL;   // [n_buckets]
+int      g_ggml_layer_n     = 0;      // number of layer buckets
+int      g_ggml_layer_on    = -1;     // -1 = not checked yet
+double * g_ggml_cum_ms      = NULL;   // running total across ubatches
+int      g_ggml_cum_n       = 0;
+
+double * ggml_layer_timing_table(int * n_buckets) {
+    *n_buckets = g_ggml_layer_n;
+    return g_ggml_layer_ms;
+}
+
+// Reallocate the bucket table so that layer ids up to `max_il` fit, keeping any
+// accumulated totals. Bucket g_ggml_layer_n is reserved for non-layer nodes, so
+// the array always holds g_ggml_layer_n + 1 entries.
+static void ggml_layer_timing_reserve(int max_il) {
+    if (max_il < g_ggml_layer_n) return;
+    int new_n = max_il + 1;
+    double * fresh = (double *) calloc((size_t)new_n + 1, sizeof(double));
+    if (fresh == NULL) return;
+    if (g_ggml_layer_ms != NULL) {
+        int keep = g_ggml_layer_n < new_n ? g_ggml_layer_n : new_n;
+        for (int i = 0; i < keep; ++i) fresh[i] = g_ggml_layer_ms[i];
+        // carry the non-layer bucket across the resize
+        fresh[new_n] = g_ggml_layer_ms[g_ggml_layer_n];
+        free(g_ggml_layer_ms);
+    }
+    g_ggml_layer_ms = fresh;
+    g_ggml_layer_n  = new_n;
+}
+
+void ggml_layer_timing_print_and_reset(const char * tag) {
+    if (g_ggml_layer_ms == NULL || g_ggml_layer_n <= 0) return;
+    // Trim trailing empty buckets (we over-reserve at init) so a 30-layer model
+    // does not print 128 rows of zeros.
+    int last = g_ggml_layer_n - 1;
+    while (last >= 0 && g_ggml_layer_ms[last] == 0.0) --last;
+    if (last < 0) return;
+
+    double tot = 0.0;
+    for (int i = 0; i <= last; ++i) tot += g_ggml_layer_ms[i];
+    tot += g_ggml_layer_ms[g_ggml_layer_n];
+
+    // Accumulate across ubatches: the per-ubatch lines show that ubatch's own
+    // split, the CUMULATIVE block shows the running total for the whole run.
+    if (g_ggml_cum_ms == NULL) {
+        g_ggml_cum_n  = g_ggml_layer_n;
+        g_ggml_cum_ms = (double *) calloc((size_t)g_ggml_cum_n + 1, sizeof(double));
+    }
+    if (g_ggml_cum_ms != NULL && g_ggml_cum_n == g_ggml_layer_n) {
+        for (int i = 0; i <= g_ggml_layer_n; ++i) g_ggml_cum_ms[i] += g_ggml_layer_ms[i];
+    }
+
+    fprintf(stderr, "[LAYER-TIMING] %s: total=%.1f ms over %d layers\n",
+            tag ? tag : "graph", tot, last + 1);
+    for (int i = 0; i <= last; ++i) {
+        fprintf(stderr, "[LAYER-TIMING]   layer %2d: %10.1f ms  (%5.1f%%)\n",
+                i, g_ggml_layer_ms[i], tot > 0 ? 100.0*g_ggml_layer_ms[i]/tot : 0.0);
+    }
+    fprintf(stderr, "[LAYER-TIMING]   other   : %10.1f ms  (%5.1f%%)\n",
+            g_ggml_layer_ms[g_ggml_layer_n],
+            tot > 0 ? 100.0*g_ggml_layer_ms[g_ggml_layer_n]/tot : 0.0);
+
+    if (g_ggml_cum_ms != NULL) {
+        double ctot = 0.0;
+        for (int i = 0; i <= g_ggml_layer_n; ++i) ctot += g_ggml_cum_ms[i];
+        fprintf(stderr, "[LAYER-TIMING] CUMULATIVE over all ubatches: total=%.1f ms\n", ctot);
+        for (int i = 0; i <= last; ++i) {
+            fprintf(stderr, "[LAYER-TIMING]   cum layer %2d: %10.1f ms  (%5.1f%%)\n",
+                    i, g_ggml_cum_ms[i], ctot > 0 ? 100.0*g_ggml_cum_ms[i]/ctot : 0.0);
+        }
+        fprintf(stderr, "[LAYER-TIMING]   cum other   : %10.1f ms  (%5.1f%%)\n",
+                g_ggml_cum_ms[g_ggml_layer_n],
+                ctot > 0 ? 100.0*g_ggml_cum_ms[g_ggml_layer_n]/ctot : 0.0);
+    }
+
+    fflush(stderr);
+    for (int i = 0; i <= g_ggml_layer_n; ++i) g_ggml_layer_ms[i] = 0.0;
+}
+
+// Pull the layer index out of a node name. ik_llama.cpp's llm_build_cb names
+// every layer tensor as "<opname>-<il>" (a numeric suffix after the last '-'),
+// e.g. "ffn_up-17", "q_in-3", "delta_net_fused_raw-1005" (the delta-net path
+// encodes 1000*il + id). We also accept the upstream ggml style "blk.<il>.x"
+// just in case. Returns -1 when no layer can be determined.
+static int ggml_layer_id_from_name(const char * name) {
+    if (name == NULL || name[0] == 0) return -1;
+    const size_t len = strlen(name);
+
+    // ggml/llama.cpp upstream style: "blk.<il>.<rest>"
+    if (len > 4 && name[0] == 'b' && name[1] == 'l' && name[2] == 'k' && name[3] == '.') {
+        int il = 0, i = 4;
+        if (name[i] < '0' || name[i] > '9') return -1;
+        while (name[i] >= '0' && name[i] <= '9') { il = il*10 + (name[i]-'0'); ++i; }
+        return il;
+    }
+
+    // ik style: numeric suffix after the final '-'.
+    size_t last_dash = len;
+    for (size_t i = len; i-- > 0; ) {
+        if (name[i] == '-') { last_dash = i; break; }
+    }
+    if (last_dash >= len - 1) return -1;          // no dash, or nothing after it
+    const char * p = name + last_dash + 1;
+    if (*p < '0' || *p > '9') return -1;
+    long v = 0;
+    for (; *p >= '0' && *p <= '9'; ++p) {
+        v = v*10 + (*p - '0');
+        if (v > 1000000) return -1;               // not a layer id
+    }
+    if (*p != 0) return -1;                       // trailing junk
+    // The delta-net / qkvz path encodes 1000*il + id; fold that back to a layer.
+    if (v >= 1000) v /= 1000;
+    return (int) v;
+}
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -29818,17 +29949,36 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
+        const bool layer_timing = g_ggml_layer_on == 1 && state->ith == 0 && g_ggml_layer_ms != NULL;
+        int64_t t_layer0 = 0;
+        int layer_id = -1;
+        if (layer_timing) {
+            t_layer0 = ggml_time_us();
+            layer_id = ggml_layer_id_from_name(node->name);
+            if (layer_id >= g_ggml_layer_n) ggml_layer_timing_reserve(layer_id);
+        }
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
 #endif
 
+        ggml_barrier(state->shared);
+
+        if (layer_timing) {
+            // Accumulate AFTER the barrier so the bucket holds the wall time of
+            // this node across all threads, not thread-0's own slice.
+            double ms = (double)(ggml_time_us() - t_layer0) / 1000.0;
+            if (layer_id >= 0 && layer_id < g_ggml_layer_n) {
+                g_ggml_layer_ms[layer_id] += ms;
+            } else {
+                g_ggml_layer_ms[g_ggml_layer_n] += ms;   // non-layer bucket
+            }
+        }
+
         if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
             state->shared->ec = GGML_STATUS_ABORTED;
         }
-
-        ggml_barrier(state->shared);
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;
@@ -29848,6 +29998,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
     int n_threads = cplan->n_threads;
+
+    // Lazy one-time check of the per-layer timing env var (see the notes at the
+    // definition of g_ggml_layer_ms near the top of this file).
+    if (g_ggml_layer_on < 0) {
+        g_ggml_layer_on = getenv("GGML_LAYER_TIMING") != NULL;
+        if (g_ggml_layer_on) ggml_layer_timing_reserve(127);
+    }
 
 #if defined(__gnu_linux__)
     // the calling thread is worker 0 and gets pinned below; remember its affinity

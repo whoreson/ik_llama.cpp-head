@@ -583,6 +583,7 @@ void server_slot::reset() {
 
     generated_token_probs.clear();
     checkpoint_pos = -1;
+    layer_ms_prompt.clear();
     image_just_processed = false;
     do_checkpoint = false;
     do_rewind_chekpoint = false;
@@ -723,6 +724,22 @@ json server_slot::get_formatted_timings() const {
         {"n_ctx",           n_ctx},
         {"n_past",           n_past},
     };
+    // Per-layer compute timing (GGML_LAYER_TIMING=1): the prompt buckets drained
+    // from the ggml table when prefill finished (see layer_timing_finish_slot).
+    // We do NOT print or reset here: that would steal the buckets, and since this
+    // runs after the sampler's llama_synchronize() it would always see an empty
+    // table -- which is why the prefill numbers used to be missing entirely.
+    if (!layer_ms_prompt.empty()) {
+        // The last entry is the non-layer ("other": final norm, output projection)
+        // bucket; the preceding entries are layers 0..N-1.
+        json arr = json::array();
+        for (size_t i = 0; i + 1 < layer_ms_prompt.size(); ++i) {
+            arr.push_back(layer_ms_prompt[i]);
+        }
+        timings["layer_ms"]       = arr;
+        timings["layer_ms_n"]     = (int) layer_ms_prompt.size() - 1;
+        timings["layer_ms_other"] = layer_ms_prompt.back();
+    }
     if (n_draft_total > 0) {
         timings["draft_n"]          = n_draft_total;
         timings["draft_n_accepted"] = n_draft_accepted;
@@ -3799,14 +3816,27 @@ void server_context::create_checkpoint_at_interval(server_slot & slot) {
 
 void server_context::apply_checkpoint(server_slot & slot) {
     llama_pos pos_next = slot.cache_tokens.pos_next(slot.n_past);
+    SLT_WRN(slot, "DEBUG apply_checkpoint start: n_past=%d, cache_tokens.size=%zu, prompt_tokens.size=%zu, pos_next=%d\n",
+        slot.n_past, slot.cache_tokens.size(), slot.prompt_tokens.size(), pos_next);
     const bool has_new_tokens = (slot.n_past < slot.prompt_tokens.size());
     const auto pos_min_thold = std::max(0, pos_next - (has_new_tokens ? 0 : 1) - llama_kv_cache_n_swa(ctx));
     const bool is_openpangu = llama_model_is_openpangu(model);
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
         int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
         if (pos_min >= pos_min_thold) {
-            SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min);
+            SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, pos_next = %d, pos_min_thold = %d, n_swa = %d\n",
+                slot.n_past, (int)slot.cache_tokens.size(), slot.id, pos_min, pos_next, pos_min_thold, llama_kv_cache_n_swa(ctx));
             // search for a context checkpoint
+            // DEBUG: log checkpoint selection decisions
+            {
+                for (const auto & cur : slot.server_cached_prompt.checkpoints) {
+                    if (cur.pos_max > pos_next) {
+                        SLT_WRN(slot, "DEBUG ckpt reject pos_max: cur.pos_max=%d > pos_next=%d\n", cur.pos_max, pos_next);
+                    } else if (!(cur.pos_min < pos_min_thold || cur.pos_min == 0)) {
+                        SLT_WRN(slot, "DEBUG ckpt reject pos_min: cur.pos_min=%d >= pos_min_thold=%d\n", cur.pos_min, pos_min_thold);
+                    }
+                }
+            }
             const auto it = std::find_if(
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
@@ -3855,8 +3885,12 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 if (!do_reset) {
                     pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                     slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
-                    auto prefix = slot.cache_tokens.get_common_prefix_first_n(ctx, slot.prompt_tokens, slot.n_past);
-                    slot.n_past_prompt = prefix.second;
+                    // After checkpoint restore, use exact token match only.
+                    // The checkpoint may contain tokens with a different tokenization than
+                    // the prompt (model-generated vs re-tokenized), so string-level matching
+                    // would produce misleading results. Just find the exact common prefix.
+                    slot.n_past = std::min(slot.n_past, (int)slot.cache_tokens.get_common_prefix_exact(slot.prompt_tokens));
+                    slot.n_past_prompt = slot.n_past;
 
                     slot.checkpoint_pos = it->pos_max;
 
@@ -3884,10 +3918,12 @@ void server_context::apply_checkpoint(server_slot & slot) {
 
     {
         // erase checkpoints whose data extends at or past the next write position
+        size_t n_erased = 0, n_kept = 0;
         for (auto it = slot.server_cached_prompt.checkpoints.begin(); it != slot.server_cached_prompt.checkpoints.end();) {
             const auto & cur = *it;
             if (cur.pos_max > pos_next) {
                 SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
+                n_erased++;
                 if (!params_base.ctx_checkpoint_spill_dir.empty() && !cur.data.empty()) {
                     spill_checkpoint(slot.id, *it, params_base.ctx_checkpoint_spill_dir);
                     ++it;
@@ -3896,9 +3932,11 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     it = drop_checkpoint_entry(slot.server_cached_prompt.checkpoints, it);
                 }
             } else {
+                n_kept++;
                 ++it;
             }
         }
+        SLT_WRN(slot, "checkpoint invalidation: pos_next=%d, erased=%zu, kept=%zu\n", pos_next, n_erased, n_kept);
     }
 }
 
@@ -4073,6 +4111,12 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.t_start_process_prompt = ggml_time_us();
                     slot.t_start_generation = 0;
 
+                    // Per-layer timing (GGML_LAYER_TIMING=1): reset the stored buckets
+                    // for this request. The accumulation window itself is opened later,
+                    // right before the first prompt ubatch is queued (see the prompt
+                    // batching loop), so cached/restored prompts are covered too.
+                    slot.layer_ms_prompt.clear();
+
                     if (slot.infill) {
                         const bool add_bos = llama_should_add_bos_token(model);
                         bool suff_rm_leading_spc = true;
@@ -4198,7 +4242,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                             // reuse any previously computed tokens that are common with the new prompt
                             common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
-                            LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
+                            LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d, offset = %d, prompt_size = %d\n",
+                                (int32_t)slot.cache_tokens.size(), (int32_t)prefix.first, (int32_t)prefix.second,
+                                (int32_t)(prefix.second - prefix.first), (int32_t)prompt_tokens.size());
                             int32_t size_threshold = 20;
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
@@ -4355,6 +4401,24 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                 int32_t ga_n = slot.ga_n;
                 int32_t ga_w = slot.ga_w;
                 const int32_t prompt_batch_i0 = batch.n_tokens;
+
+                // Per-layer timing (GGML_LAYER_TIMING=1): open this slot's
+                // accumulation window before the first prompt ubatch is queued.
+                // Doing it here (not in the tokenize branch) covers every path that
+                // actually evaluates prompt tokens, including prompts restored from
+                // the cache/checkpoint. The hold keeps llama_synchronize() from
+                // zeroing the buckets on the first sampler call so all prefill
+                // ubatches add up; layer_timing_finish_slot() drains them.
+                if (getenv("GGML_LAYER_TIMING") != NULL && !slot.layer_timing_active &&
+                        slot.n_past_prompt < slot.n_prompt_tokens) {
+                    if (layer_timing_prefill_slots == 0) {
+                        ggml_layer_timing_clear();
+                    }
+                    layer_timing_prefill_slots++;
+                    slot.layer_timing_active = true;
+                    slot.layer_ms_prompt.clear();
+                    ggml_layer_timing_hold(1);
+                }
 
                 // add prompt tokens for processing in the current batch
                 // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
@@ -4931,6 +4995,122 @@ void server_context::update_allowlist_state(server_slot& slot) {
 }
 
 
+// Snapshot the global ggml layer buckets into `slot.layer_ms_prompt`, replacing
+// whatever was stored. The table is over-reserved (n_buckets is a compile-time
+// ceiling, not the real layer count), so trailing empty buckets are trimmed; the
+// final "other" bucket is kept separately as the last element.
+static void layer_timing_snapshot_into(server_slot & slot, bool accumulate) {
+    int n_buckets = 0;
+    double * tbl = ggml_layer_timing_table(&n_buckets);
+    if (tbl == NULL || n_buckets <= 0) {
+        return;
+    }
+    int last = n_buckets - 1;
+    while (last >= 0 && tbl[last] == 0.0) {
+        --last;
+    }
+    if (last < 0 && tbl[n_buckets] == 0.0) {
+        return; // nothing measured in this window
+    }
+    if (accumulate && (int) slot.layer_ms_prompt.size() == last + 2) {
+        for (int i = 0; i <= last; ++i) slot.layer_ms_prompt[i] += tbl[i];
+        slot.layer_ms_prompt[last + 1] += tbl[n_buckets];
+    } else {
+        slot.layer_ms_prompt.assign(tbl, tbl + last + 1);
+        slot.layer_ms_prompt.push_back(tbl[n_buckets]); // "other"
+    }
+}
+
+// Called after each prompt ubatch has been computed (see process_batch_tokens).
+// The ggml buckets hold exactly this ubatch's per-layer wall time, so fold them
+// into the prefill window of the slot(s) that contributed to [i0, i1) and reset
+// so the next ubatch starts clean. This is what actually makes the per-layer
+// numbers exist for the server: it does not depend on the sampler's
+// llama_synchronize() or on hitting n_decoded == 1.
+void server_context::layer_timing_accumulate_batch(int i0, int n_tokens) {
+    if (getenv("GGML_LAYER_TIMING") == NULL) {
+        return;
+    }
+    int n_active = 0;
+    server_slot * active = nullptr;
+    for (auto & slot : slots) {
+        if (!slot.layer_timing_active) {
+            continue;
+        }
+        if (server_slot_prompt_batch_overlaps(slot, i0, i0 + n_tokens)) {
+            ++n_active;
+            active = &slot;
+        }
+    }
+    if (getenv("GGML_LAYER_TIMING_DEBUG") != NULL) {
+        int n_buckets_dbg = 0;
+        ggml_layer_timing_table(&n_buckets_dbg);
+        fprintf(stderr, "[LAYER-TIMING-DEBUG] accumulate i0=%d n=%d active=%d table_n=%d total=%.1f\n",
+                i0, n_tokens, n_active, n_buckets_dbg, ggml_layer_timing_total());
+    }
+    if (n_active > 0) {
+        // exact per-slot attribution only when a single slot is prefilling
+        if (n_active == 1) {
+            layer_timing_snapshot_into(*active, /*accumulate=*/true);
+            // Also emit the per-ubatch table so the run is readable while it is
+            // still prefilling. NOTE: `n_tokens` here is the server-side slice
+            // size (llama_n_batch(), i.e. -b), NOT the graph ubatch size -- the
+            // server hands n_batch-sized views to llama_decode(), which then
+            // micro-batches them internally according to -ub. Report that real
+            // graph ubatch size instead, otherwise this label contradicts the
+            // key we are trying to measure (see ggml_layer_timing_graph_n_tokens).
+            ggml_layer_timing_print_ubatch(ggml_layer_timing_graph_n_tokens(n_tokens));
+            return; // print_ubatch resets the table
+        } else {
+            fprintf(stderr, "[LAYER-TIMING] ubatch n=%d (prompt, %d slots): per-layer time shared, not stored per slot\n",
+                    ggml_layer_timing_graph_n_tokens(n_tokens), n_active);
+            ggml_layer_timing_print_ubatch(ggml_layer_timing_graph_n_tokens(n_tokens));
+            return; // print_ubatch resets the table
+        }
+    }
+    // reset the per-ubatch buckets so the next ubatch accumulates from zero
+    ggml_layer_timing_clear();
+}
+
+void server_context::layer_timing_finish_slot(server_slot & slot) {
+    if (!slot.layer_timing_active) {
+        return;
+    }
+    slot.layer_timing_active = false;
+
+    if (layer_timing_prefill_slots > 0) {
+        layer_timing_prefill_slots--;
+    }
+
+    // Merge any buckets still sitting in the table (a last prompt ubatch that was
+    // not yet folded in) into the slot, then drop this slot's hold.
+    layer_timing_snapshot_into(slot, /*accumulate=*/true);
+
+    ggml_layer_timing_hold(0);
+}
+
+// Print the slot's accumulated prefill table (last element is the "other" bucket).
+void server_context::print_slot_layer_timing(const server_slot & slot) {
+    const std::vector<double> & v = slot.layer_ms_prompt;
+    if (v.size() < 2) {
+        return;
+    }
+    const int n_layers = (int) v.size() - 1;
+    double tot = 0.0;
+    for (double x : v) tot += x;
+
+    fprintf(stderr, "[LAYER-TIMING] slot %d prefill: %d prompt tokens over %d ubatch-time layers, total=%.1f ms, prompt_ms=%.1f\n",
+            slot.id, slot.n_prompt_tokens_processed, n_layers, tot, slot.t_prompt_processing);
+    for (int i = 0; i < n_layers; ++i) {
+        fprintf(stderr, "[LAYER-TIMING]   layer %2d: %10.1f ms  (%5.1f%%)\n",
+                i, v[i], tot > 0 ? 100.0*v[i]/tot : 0.0);
+    }
+    fprintf(stderr, "[LAYER-TIMING]   other   : %10.1f ms  (%5.1f%%)\n",
+            v[n_layers], tot > 0 ? 100.0*v[n_layers]/tot : 0.0);
+    fflush(stderr);
+}
+
+
 void server_context::process_batch_tokens(int32_t & n_batch) {
     for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
         const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -4967,6 +5147,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 for (auto& slot : slots) {
                     slot.state = SLOT_STATE_PROCESSING;
                     slot.command = SLOT_COMMAND_NONE;
+                    // Per-layer timing: prefill was aborted (cancel or KV failure) so it
+                    // will never reach n_decoded == 1. Flush whatever was accumulated so
+                    // far so the partial per-layer numbers are not silently lost.
+                    if (slot.layer_timing_active) {
+                        layer_timing_finish_slot(slot);
+                        if (!slot.layer_ms_prompt.empty()) {
+                            print_slot_layer_timing(slot);
+                        }
+                    }
                     if (ret == user_cancel) {
                         llama_pos cur_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
                         slot.n_past = slot.cache_tokens.size_up_to_pos(cur_pos + 1);
@@ -4993,6 +5182,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             continue; // continue loop of n_batch
         }
+
+        // Per-layer compute timing (GGML_LAYER_TIMING=1): the ubatch has just been
+        // computed by server_decode() above, so the ggml layer buckets hold this
+        // ubatch's per-layer wall time. Snapshot it into the slot(s) that have an
+        // open prefill window and reset, so prefill is measured ubatch-by-ubatch.
+        layer_timing_accumulate_batch(i, n_tokens);
 
     if (server_speculative_uses_target_features(params_base.speculative)) {
         for (auto & slot : slots) {
@@ -5040,6 +5235,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             // prompt evaluated for embedding
             if (slot.embedding) {
                 send_embedding(slot, batch_view);
+                // Per-layer timing: embeddings never decode a token, so this is
+                // their end-of-prefill point -- drain the buckets before release.
+                layer_timing_finish_slot(slot);
                 slot.release();
                 slot.i_batch = -1;
                 continue; // continue loop of slots
@@ -5047,6 +5245,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             if (slot.task->type == SERVER_TASK_TYPE_DECISION) {
                 send_decision(slot, slot.i_batch - i);
+                layer_timing_finish_slot(slot);
                 slot.release();
                 slot.i_batch = -1;
                 continue; // continue loop of slots
@@ -5102,6 +5301,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     {"error", e.what()},
                 });
                 send_error(slot, std::string("sampling error: ") + e.what(), ERROR_TYPE_SERVER);
+                layer_timing_finish_slot(slot);
                 slot.release();
                 slot.i_batch = -1;
                 continue;
@@ -5113,6 +5313,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (slot.n_decoded == 1) {
                 slot.t_start_generation = ggml_time_us();
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                // Per-layer compute timing (GGML_LAYER_TIMING=1): prefill is done and
+                // the per-ubatch numbers were folded into slot.layer_ms_prompt by
+                // layer_timing_accumulate_batch(). Print that accumulated table to
+                // the server log now (before generation), and release the window.
+                const bool had_layer_window = slot.layer_timing_active;
+                layer_timing_finish_slot(slot);
+                if (had_layer_window && !slot.layer_ms_prompt.empty()) {
+                    print_slot_layer_timing(slot);
+                }
                 metrics.on_prompt_eval(slot);
                 // create checkpoint after prompt processing ends
                 if (params_base.ctx_checkpoints_tolerance<=0 && params_base.do_checkpoint) {
@@ -5312,6 +5521,15 @@ void server_context::update_slots() {
 
     // process the created batch of tokens
     process_batch_tokens(n_batch); // Decode with batch
+
+    // Per-layer timing safety net: if a slot's prefill window is still open but it
+    // is no longer processing (an error/cancel path released it without draining),
+    // close it here so the shared hold cannot leak.
+    for (auto & slot : slots) {
+        if (slot.layer_timing_active && slot.state == SLOT_STATE_IDLE) {
+            layer_timing_finish_slot(slot);
+        }
+    }
 
     LOG_VERBOSE("run slots completed", {});
 }

@@ -182,6 +182,12 @@ struct server_slot {
     double t_prompt_processing; // ms
     double t_token_generation; // ms
 
+    // Per-layer compute timing (GGML_LAYER_TIMING=1). The ggml buckets accumulate
+    // across every ubatch of this slot's prompt and are drained here when prompt
+    // processing finishes, so prefill is measured per layer and not only decode.
+    std::vector<double> layer_ms_prompt; // per-layer prompt totals (last entry = "other")
+    bool layer_timing_active = false;    // this slot holds one ggml accumulation window
+
     void reset();
 
     bool need_embd() const;
@@ -277,6 +283,25 @@ struct server_context {
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
+
+    // Per-layer timing (GGML_LAYER_TIMING=1) bookkeeping. The ggml buckets are a
+    // single process-global table, so per-slot attribution is only exact while
+    // one slot is prefilling. `layer_timing_prefill_slots` counts the slots whose
+    // prefill window is currently open; when it exceeds 1 the drained numbers are
+    // shared between them and are not attributed to any individual slot.
+    int32_t layer_timing_prefill_slots = 0;
+
+    // Finish the per-layer timing window opened for `slot` (if any): snapshot the
+    // ggml buckets into the slot and drop the slot's hold. Safe to call on any
+    // exit path (embedding, error, cancel); a no-op when the window is not open.
+    void layer_timing_finish_slot(server_slot & slot);
+
+    // Print a slot's accumulated per-layer prefill table to stderr.
+    void print_slot_layer_timing(const server_slot & slot);
+
+    // Fold the just-computed prompt ubatch [i0, i0+n_tokens) into the prefill
+    // window of the slot(s) that produced it, then reset the ggml buckets.
+    void layer_timing_accumulate_batch(int i0, int n_tokens);
 
     common_chat_templates_ptr chat_templates;
     server_chat_params  chat_params;

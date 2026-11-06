@@ -2953,7 +2953,25 @@ extern "C" {
     // layer via their "blk.<il>.<...>" tensor name; everything else lands in a
     // trailing "other" bucket. Print (and zero) the accumulated buckets.
     GGML_API void   ggml_layer_timing_print_and_reset(const char * tag);
+    // Compact per-ubatch report (header + per-layer lines) and reset. Called by
+    // ggml_graph_compute() so long prefills report while they are still running.
+    GGML_API void   ggml_layer_timing_print_ubatch(int n_tokens);
+    // Token count of the graph (micro-batch) most recently executed, i.e. the
+    // real -ub value, regardless of the outer -b batch size. Returns ``fallback``
+    // if no graph has run yet.
+    GGML_API int    ggml_layer_timing_graph_n_tokens(int fallback);
+    // Print the running total accumulated across all ubatches, then clear it.
+    GGML_API void   ggml_layer_timing_print_cumulative(void);
     GGML_API double * ggml_layer_timing_table(int * n_buckets);
+    // Sum of all buckets (layers + "other") without printing or resetting.
+    GGML_API double ggml_layer_timing_total(void);
+    // Zero all buckets without printing.
+    GGML_API void   ggml_layer_timing_clear(void);
+    // Hold/stop holding the buckets. While held, llama_synchronize() does not
+    // auto-print and reset them, so a caller (the server) can accumulate a whole
+    // prompt across many ubatches and drain the table itself.
+    GGML_API void   ggml_layer_timing_hold(int on);
+    GGML_API bool   ggml_layer_timing_held(void);
 
     GGML_API struct ggml_tensor * ggml_graph_get_tensor(struct ggml_cgraph * cgraph, const char * name);
 

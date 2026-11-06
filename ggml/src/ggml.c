@@ -66,10 +66,51 @@ int      g_ggml_layer_n     = 0;      // number of layer buckets
 int      g_ggml_layer_on    = -1;     // -1 = not checked yet
 double * g_ggml_cum_ms      = NULL;   // running total across ubatches
 int      g_ggml_cum_n       = 0;
+// Token count of the graph that was last executed. This is the real micro-batch
+// (ubatch) size: the server hands llama_decode() a -b sized batch and llama.cpp
+// splits it into -ub sized graphs internally, so callers that only see the outer
+// batch size cannot tell 256 from 512. Recorded per graph so they can.
+int      g_ggml_layer_graph_n_tokens = 0;
+
+// When > 0 the automatic per-ubatch print in llama_synchronize() is suppressed,
+// so that a caller that owns a longer accumulation window (e.g. the server, which
+// wants all ubatches of one prompt rather than one block per ubatch) can drain the
+// buckets itself and attribute them to the right slot. Reference counted so an
+// error path can always drop its own hold without stealing another caller's.
+static int g_ggml_layer_hold = 0;
 
 double * ggml_layer_timing_table(int * n_buckets) {
     *n_buckets = g_ggml_layer_n;
     return g_ggml_layer_ms;
+}
+
+void ggml_layer_timing_hold(int on) {
+    if (on > 0) {
+        g_ggml_layer_hold++;
+    } else if (g_ggml_layer_hold > 0) {
+        g_ggml_layer_hold--;
+    }
+}
+
+bool ggml_layer_timing_held(void) {
+    return g_ggml_layer_hold > 0;
+}
+
+double ggml_layer_timing_total(void) {
+    if (g_ggml_layer_ms == NULL || g_ggml_layer_n <= 0) return 0.0;
+    double tot = 0.0;
+    for (int i = 0; i <= g_ggml_layer_n; ++i) tot += g_ggml_layer_ms[i];
+    return tot;
+}
+
+static void ggml_layer_timing_zero(void) {
+    if (g_ggml_layer_ms != NULL) {
+        for (int i = 0; i <= g_ggml_layer_n; ++i) g_ggml_layer_ms[i] = 0.0;
+    }
+}
+
+void ggml_layer_timing_clear(void) {
+    ggml_layer_timing_zero();
 }
 
 // Reallocate the bucket table so that layer ids up to `max_il` fit, keeping any
@@ -89,6 +130,79 @@ static void ggml_layer_timing_reserve(int max_il) {
     }
     g_ggml_layer_ms = fresh;
     g_ggml_layer_n  = new_n;
+}
+
+// Print the accumulated per-layer buckets for the ubatch that just finished and
+// reset them. Each entry is that layer's whole wall time (attention + SSM +
+// FFN + norms), regardless of layer type. Called from ggml_graph_compute(), so a
+// long prompt reports layer-by-layer WHILE it is still being prefilled instead of
+// only once at the end.
+// Report the graph (micro-batch) token count actually executed. When
+// ``fallback`` is > 0 and no graph has run yet, return it instead, so a caller
+// that fires before the first graph still prints something sane.
+int ggml_layer_timing_graph_n_tokens(int fallback) {
+    if (g_ggml_layer_graph_n_tokens > 0) return g_ggml_layer_graph_n_tokens;
+    return fallback;
+}
+
+void ggml_layer_timing_print_ubatch(int n_tokens) {
+    if (g_ggml_layer_ms == NULL || g_ggml_layer_n <= 0) return;
+    int last = g_ggml_layer_n - 1;
+    while (last >= 0 && g_ggml_layer_ms[last] == 0.0) --last;
+    if (last < 0 && g_ggml_layer_ms[g_ggml_layer_n] == 0.0) return;
+
+    double tot = 0.0;
+    for (int i = 0; i <= last; ++i) tot += g_ggml_layer_ms[i];
+    tot += g_ggml_layer_ms[g_ggml_layer_n];
+
+    // keep the running total for the final CUMULATIVE print, but do not print it
+    // per ubatch
+    if (g_ggml_cum_ms == NULL) {
+        g_ggml_cum_n  = g_ggml_layer_n;
+        g_ggml_cum_ms = (double *) calloc((size_t)g_ggml_cum_n + 1, sizeof(double));
+    }
+    if (g_ggml_cum_ms != NULL && g_ggml_cum_n == g_ggml_layer_n) {
+        for (int i = 0; i <= g_ggml_layer_n; ++i) g_ggml_cum_ms[i] += g_ggml_layer_ms[i];
+    }
+
+    fprintf(stderr, "[LAYER-TIMING] ubatch n=%d (%s): total=%.1f ms over %d layers\n",
+            n_tokens, n_tokens > 1 ? "prompt" : "gen", tot, last + 1);
+    for (int i = 0; i <= last; ++i) {
+        fprintf(stderr, "[LAYER-TIMING]   layer %2d: %10.1f ms  (%5.1f%%)\n",
+                i, g_ggml_layer_ms[i], tot > 0 ? 100.0*g_ggml_layer_ms[i]/tot : 0.0);
+    }
+    fprintf(stderr, "[LAYER-TIMING]   other   : %10.1f ms  (%5.1f%%)\n",
+            g_ggml_layer_ms[g_ggml_layer_n],
+            tot > 0 ? 100.0*g_ggml_layer_ms[g_ggml_layer_n]/tot : 0.0);
+    fflush(stderr);
+
+    ggml_layer_timing_zero();
+}
+
+// Print the running total accumulated across all ubatches since the process
+// started, then clear it. Used as the end-of-run summary (llama_synchronize).
+void ggml_layer_timing_print_cumulative(void) {
+    if (g_ggml_cum_ms == NULL || g_ggml_layer_n <= 0) return;
+
+    int last = g_ggml_layer_n - 1;
+    while (last >= 0 && g_ggml_cum_ms[last] == 0.0) --last;
+    if (last < 0 && g_ggml_cum_ms[g_ggml_layer_n] == 0.0) return;
+
+    double ctot = 0.0;
+    for (int i = 0; i <= last; ++i) ctot += g_ggml_cum_ms[i];
+    ctot += g_ggml_cum_ms[g_ggml_layer_n];
+
+    fprintf(stderr, "[LAYER-TIMING] CUMULATIVE over all ubatches: total=%.1f ms\n", ctot);
+    for (int i = 0; i <= last; ++i) {
+        fprintf(stderr, "[LAYER-TIMING]   cum layer %2d: %10.1f ms  (%5.1f%%)\n",
+                i, g_ggml_cum_ms[i], ctot > 0 ? 100.0*g_ggml_cum_ms[i]/ctot : 0.0);
+    }
+    fprintf(stderr, "[LAYER-TIMING]   cum other   : %10.1f ms  (%5.1f%%)\n",
+            g_ggml_cum_ms[g_ggml_layer_n],
+            ctot > 0 ? 100.0*g_ggml_cum_ms[g_ggml_layer_n]/ctot : 0.0);
+    fflush(stderr);
+
+    for (int i = 0; i <= g_ggml_layer_n; ++i) g_ggml_cum_ms[i] = 0.0;
 }
 
 void ggml_layer_timing_print_and_reset(const char * tag) {
@@ -137,7 +251,7 @@ void ggml_layer_timing_print_and_reset(const char * tag) {
     }
 
     fflush(stderr);
-    for (int i = 0; i <= g_ggml_layer_n; ++i) g_ggml_layer_ms[i] = 0.0;
+    ggml_layer_timing_zero();
 }
 
 // Pull the layer index out of a node name. ik_llama.cpp's llm_build_cb names
@@ -29969,11 +30083,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             // Accumulate AFTER the barrier so the bucket holds the wall time of
             // this node across all threads, not thread-0's own slice.
             double ms = (double)(ggml_time_us() - t_layer0) / 1000.0;
-            if (layer_id >= 0 && layer_id < g_ggml_layer_n) {
-                g_ggml_layer_ms[layer_id] += ms;
-            } else {
-                g_ggml_layer_ms[g_ggml_layer_n] += ms;   // non-layer bucket
-            }
+            int idx = (layer_id >= 0 && layer_id < g_ggml_layer_n) ? layer_id : g_ggml_layer_n;
+            g_ggml_layer_ms[idx] += ms;
         }
 
         if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
@@ -30093,6 +30204,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    // Per-ubatch per-layer timing: this runs once per graph (= one ubatch) on the
+    // thread that actually computed it, so long prompts report incrementally while
+    // they are still being prefilled. Suppressed while a caller holds the buckets
+    // (the server aggregates a whole prompt and drains it itself).
+    if (g_ggml_layer_on == 1) {
+        // cgraph->n_batch is llm.n_tokens, i.e. the ubatch this graph computes.
+        // Stash it so the server can label its per-ubatch table with the real
+        // micro-batch size rather than the outer -b slice size.
+        g_ggml_layer_graph_n_tokens = cgraph->n_batch;
+        if (!ggml_layer_timing_held()) {
+            ggml_layer_timing_print_ubatch(cgraph->n_batch);
+        }
+    }
 
 #if defined(__gnu_linux__)
     if (restore_affinity) {

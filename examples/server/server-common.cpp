@@ -387,35 +387,25 @@ size_t find_n_tokens_from_string_with_ignore(const llama_context* ctx, const lla
 }
 
 common_prefix find_common_text_token_prefix(const llama_context* ctx, const llama_tokens& a, const llama_tokens& b,
-    size_t start, bool exact) {
+    size_t start, bool /*exact, unused: whitespace is content, matching is always byte-exact*/) {
     common_prefix token_prefix;
     if (a.size() <= start || b.size() <= start) {
         return token_prefix;
     }
-    std::set<char> ignore_set = { ' ', '\n' ,'\r' };
 
     llama_tokens a_sub(a.begin() + start, a.end());
     llama_tokens b_sub(b.begin() + start, b.end());
 
     std::string a_str = common_detokenize(ctx, a_sub, true);
     std::string b_str = common_detokenize(ctx, b_sub, true);
-    common_prefix string_prefix;
-
+    // Byte-exact match of the detokenized text. Same text tokenized differently still
+    // matches (shared token boundary found below); any real character difference,
+    // including whitespace, ends the common prefix.
     std::vector<size_t> a_list;
     std::vector<size_t> b_list;
-
-    if (exact) {
-        size_t lcp = common_part(a_str, b_str);
-        string_prefix.first = lcp;
-        string_prefix.second = lcp;
-        token_prefix.first = find_n_tokens_from_string(ctx, a_sub, string_prefix.first, 0, a_list);
-        token_prefix.second = find_n_tokens_from_string(ctx, b_sub, string_prefix.second, 0, b_list);
-    }
-    else {
-        string_prefix = find_common_string_prefix(a_str, b_str, ignore_set);
-        token_prefix.first = find_n_tokens_from_string_with_ignore(ctx, a_sub, string_prefix.first, 0, ignore_set, a_list);
-        token_prefix.second = find_n_tokens_from_string_with_ignore(ctx, b_sub, string_prefix.second, 0, ignore_set, b_list);
-    }
+    const size_t lcp = common_part(a_str, b_str);
+    find_n_tokens_from_string(ctx, a_sub, lcp, 0, a_list);
+    find_n_tokens_from_string(ctx, b_sub, lcp, 0, b_list);
 
     token_prefix = find_largest_common_number(a_list, b_list);
     return token_prefix;
@@ -1597,6 +1587,12 @@ common_prefix server_tokens::get_common_prefix(const llama_context* ctx, const s
         token_prefix = find_common_text_token_prefix(ctx, this->tokens, b.tokens, n, exact);
         token_prefix.first += n;
         token_prefix.second += n;
+        // DEBUG: log when exact and string prefix disagree on token counts
+        if (token_prefix.first != token_prefix.second && token_prefix.first > 100) {
+            // only log for long prefixes to avoid spam
+            LLAMA_LOG_INFO("DEBUG get_common_prefix: exact_match=%zu, string_match a=%zu b=%zu, total a=%zu b=%zu\n",
+                n, token_prefix.first - n, token_prefix.second - n, token_prefix.first, token_prefix.second);
+        }
         return token_prefix;
     }
     size_t i = n;
